@@ -1,18 +1,20 @@
-"""Engine tests — plain asserts, no pytest required:  py tests/test_replay.py
+"""Engine tests. Ticks are handcrafted arrays; no data files needed."""
 
-Ticks are handcrafted arrays; no data files needed.
-"""
-
-import os
-import sys
+import datetime as dt
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from tickreplay.replay import (CostModel, ExitRules, ReplayEngine,
-                               count_rollovers, eu_broker_offset,
-                               fixed_offset)
+from tickreplay.replay import (
+    CostModel,
+    ExitRules,
+    ReplayEngine,
+    count_rollovers,
+    eu_broker_offset,
+    fixed_offset,
+    ny_close_offset,
+    rollover_times,
+    swap_days,
+)
 
 T0 = 1_700_000_000_000  # fixed epoch ms
 STEP = 1000             # 1 tick per second
@@ -80,10 +82,9 @@ def test_one_position_at_a_time():
     eng = engine(px)
     sig = [{"ts": T0 + i * STEP, "dir": "BUY", "vol": 0.01} for i in range(1, 6)]
     trades = eng.run(sig, ExitRules(stop_pips=500, take_pips=500))
-    # signals inside the open trade are skipped -> only 1 trade
-    assert len(trades) <= 2
-    if len(trades) == 2:
-        assert trades[1].decision_ts >= trades[0].exit_ts
+    # every later signal falls inside the open trade -> skipped
+    assert len(trades) == 1
+    assert trades[0].reason == "eod"
 
 
 def test_break_even_then_stop():
@@ -127,7 +128,7 @@ def test_end_of_data_exit():
     assert trades[0].reason == "eod"
 
 
-def test_costs_commission_and_swap():
+def test_costs_commission_without_rollover():
     costs = CostModel(commission_per_lot_rt=2.0,
                       swap_per_lot_night_buy=-1.0,
                       rollover_offset=fixed_offset(0))
@@ -135,8 +136,79 @@ def test_costs_commission_and_swap():
     sig = [{"ts": T0 + 500, "dir": "BUY", "vol": 0.02}]
     trades = eng.run(sig, ExitRules(stop_pips=10, take_pips=50))
     t = trades[0]
-    assert t.reason == "eod"
+    assert t.reason == "eod" and t.nights == 0
     assert abs(t.pnl_usd - (0.0 - 2.0 * 0.02)) < 1e-9   # flat pips - commission
+
+
+def _ms(s):
+    return int(dt.datetime.fromisoformat(s).replace(tzinfo=dt.timezone.utc).timestamp() * 1000)
+
+
+def test_swap_charged_when_holding_over_rollover():
+    # Wednesday 2024-01-10 20:00 UTC -> Thursday 10:00 UTC crosses the
+    # Wednesday rollover (22:00 UTC in winter) -> triple swap
+    start = _ms("2024-01-10T20:00:00")
+    hours = 14
+    px = [1.10000] * (hours + 1)
+    costs = CostModel(swap_per_lot_night_buy=-2.0, swap_per_lot_night_sell=0.5)
+    eng = engine(px, spread=0.0, costs=costs, start=start, step=3_600_000)
+    for direction, per_day in (("BUY", -2.0), ("SELL", 0.5)):
+        t = eng.run([{"ts": start, "dir": direction, "vol": 0.10}],
+                    ExitRules(stop_pips=10, take_pips=50))[0]
+        assert t.nights == 1 and t.swap_days == 3
+        assert abs(t.pnl_usd - per_day * 0.10 * 3) < 1e-9
+
+
+def test_swap_days_weekend_and_triple_wednesday():
+    off = ny_close_offset()
+    # Friday evening -> Monday: 3 server midnights, only Friday's is charged
+    fri, mon = _ms("2024-01-05T20:00:00"), _ms("2024-01-08T10:00:00")
+    assert count_rollovers(fri, mon, off) == 3
+    assert swap_days(fri, mon, off) == 1
+    # Wednesday -> Thursday: triple
+    assert swap_days(_ms("2024-01-10T20:00:00"), _ms("2024-01-11T10:00:00"), off) == 3
+    # a full week Monday -> Monday: 1+1+3+1+1+0+0
+    assert swap_days(_ms("2024-01-08T10:00:00"), _ms("2024-01-15T10:00:00"), off) == 7
+    # 7-day markets: every rollover once
+    assert swap_days(fri, mon, off, triple_weekday=None) == 3
+
+
+def test_ny_close_rollover_follows_us_dst():
+    off = ny_close_offset()
+    assert off(_ms("2024-01-15T12:00:00")) == 2
+    assert off(_ms("2024-07-15T12:00:00")) == 3
+    # US DST starts 2024-03-10 (EU only on 03-31): rollover moves 22:00 -> 21:00 UTC
+    got = rollover_times(_ms("2024-03-08T12:00:00"), _ms("2024-03-12T12:00:00"), off)
+    hours = [dt.datetime.fromtimestamp(t / 1000, dt.timezone.utc).hour for t in got]
+    assert hours == [22, 22, 21, 21]
+
+
+def test_decision_quote_includes_tick_at_decision_instant():
+    # bid/ask jump exactly at the first tick after the decision time
+    bts = np.array([T0, T0 + 1000, T0 + 2000, T0 + 3000], dtype=np.int64)
+    bpx = np.array([1.10000, 1.10050, 1.10050, 1.10050])
+    eng = ReplayEngine(bts, bpx, bts.copy(), bpx + 0.0001)
+    t = eng.run([{"ts": T0 + 500, "dir": "BUY", "vol": 0.01}],
+                ExitRules(stop_pips=10, take_pips=50))[0]
+    assert t.entry_ts == T0 + 1000 and t.decision_ts == T0 + 500
+    assert abs(t.entry - 1.10060) < 1e-9        # new ask, not the stale one
+
+
+def test_gapped_stop_fills_at_worse_price():
+    px = [1.10000] * 3 + [1.09800] + [1.09800] * 3   # 20-pip gap down
+    eng = engine(px, spread=0.0)
+    t = eng.run([{"ts": T0 + 500, "dir": "BUY", "vol": 0.01}],
+                ExitRules(stop_pips=5, take_pips=50))[0]
+    assert t.reason == "sl"
+    assert abs(t.pnl_pips + 20.0) < 1e-6
+
+
+def test_sell_take_profit():
+    px = [1.10000] * 3 + [1.10000 - i * PIP for i in range(1, 12)]
+    eng = engine(px)
+    t = eng.run([{"ts": T0 + 500, "dir": "SELL", "vol": 0.01}],
+                ExitRules(stop_pips=10, take_pips=5))[0]
+    assert t.reason == "tp" and abs(t.pnl_pips - 5.0) < 1e-6
 
 
 def test_callable_volume_sizing():
@@ -172,15 +244,3 @@ def test_eu_broker_offset_dst():
     jul = 1_720_000_000_000   # ~2024-07
     assert off(jan) == 2
     assert off(jul) == 3
-
-
-def run_all():
-    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
-    for fn in fns:
-        fn()
-        print(f"PASS {fn.__name__}")
-    print(f"\n{len(fns)} tests passed")
-
-
-if __name__ == "__main__":
-    run_all()

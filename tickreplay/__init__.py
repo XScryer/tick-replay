@@ -7,4 +7,4 @@ Pipeline:
     4. tickreplay.regime   -> optional causal market-regime classifier
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

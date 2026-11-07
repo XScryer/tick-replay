@@ -17,10 +17,10 @@ HOW TO USE:
     from tickreplay.regime import regime_opinion
 
     # bars: dict of numpy arrays with "t0" (UTC ms) and "o","h","l","c" (price)
-    opinion = regime_opinion(bars)                 # validated defaults
+    opinion = regime_opinion(bars)                 # default parameters
     # opinion is an int8 array of the same length as bars["c"]
 
-Parameters (all optional; defaults validated on EURUSD M15):
+Parameters (all optional; defaults chosen for EURUSD M15):
 
     K        analysis window in bars           (12 = 3h on M15)
     net_min  minimum net move in pips          (10.0)

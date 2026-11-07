@@ -13,7 +13,9 @@ Bars are always derived from ticks (bid side) so the whole pipeline depends on
 a single data source and stays internally consistent.
 """
 
+import datetime as dt
 import os
+
 import numpy as np
 import pandas as pd
 
@@ -42,23 +44,41 @@ def npz_files(bin_dir, side, years=None):
     return out
 
 
-def load_ticks(bin_dir, side, years=None):
-    """Return (ts, px): int64 epoch-ms UTC and float64 prices, concatenated."""
+def _years_between(start_ms, end_ms):
+    y0 = dt.datetime.fromtimestamp(start_ms / 1000, dt.timezone.utc).year
+    y1 = dt.datetime.fromtimestamp(end_ms / 1000, dt.timezone.utc).year
+    return set(range(y0, y1 + 1))
+
+
+def load_ticks(bin_dir, side, years=None, start_ms=None, end_ms=None):
+    """Return (ts, px): int64 epoch-ms UTC and float64 prices, concatenated.
+
+    ``start_ms``/``end_ms`` (inclusive/exclusive) restrict the result to a
+    time window; each yearly file is sliced before concatenation, so memory
+    use is bounded by the window rather than by whole years. When a window is
+    given and ``years`` is not, only the overlapping year files are opened.
+    """
+    if years is None and start_ms is not None and end_ms is not None:
+        years = _years_between(start_ms, end_ms - 1)
     paths = npz_files(bin_dir, side, years)
-    if not paths:
-        return (np.array([], dtype=np.int64),
-                np.array([], dtype=np.float64))
     ts_parts, px_parts = [], []
     for p in paths:
-        z = np.load(p)
-        ts_parts.append(z["ts"])
-        px_parts.append(z["px"])
+        with np.load(p) as z:
+            ts, px = z["ts"], z["px"]
+        lo = 0 if start_ms is None else int(np.searchsorted(ts, start_ms, "left"))
+        hi = len(ts) if end_ms is None else int(np.searchsorted(ts, end_ms, "left"))
+        if hi > lo:
+            ts_parts.append(ts[lo:hi])
+            px_parts.append(px[lo:hi])
+    if not ts_parts:
+        return (np.array([], dtype=np.int64),
+                np.array([], dtype=np.float64))
     return np.concatenate(ts_parts), np.concatenate(px_parts)
 
 
-def load_both_sides(bin_dir, years=None):
+def load_both_sides(bin_dir, years=None, start_ms=None, end_ms=None):
     """Return dict {'BID': (ts,px), 'ASK': (ts,px)}."""
-    return {s: load_ticks(bin_dir, s, years) for s in SIDES}
+    return {s: load_ticks(bin_dir, s, years, start_ms, end_ms) for s in SIDES}
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +109,16 @@ def build_bars(ts, px, bar_ms):
         "l": np.minimum.reduceat(px, starts).astype(np.float64),
         "c": px[ends - 1].astype(np.float64),
     }
+
+
+def timeframe_ms(tf):
+    """'15m' -> 900000. Units: s, m, h, d."""
+    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    num = "".join(ch for ch in tf if ch.isdigit())
+    unit = "".join(ch for ch in tf if ch.isalpha()) or "m"
+    if unit[0] not in mult or (num and int(num) <= 0):
+        raise ValueError(f"bad timeframe {tf!r} (use e.g. 1m, 15m, 1h, 1d)")
+    return int(num or 1) * mult[unit[0]] * 1000
 
 
 # ---------------------------------------------------------------------------
@@ -124,21 +154,22 @@ def _merge_side_csvs(paths):
 
 
 def _split_by_year(ts, px):
-    """Yield (year, ts_seg, px_seg) for contiguous year runs (ts must be sorted)."""
-    years = (ts // 1000).astype("datetime64[s]").astype("datetime64[Y]").astype(np.int64) + 1970
-    ini = 0
-    for a in np.unique(years):
-        idx = np.nonzero(years == a)[0]
-        if len(idx) == 0:
-            continue
-        yield int(a), ts[ini:idx[-1] + 1], px[ini:idx[-1] + 1]
-        ini = idx[-1] + 1
+    """Yield (year, ts_seg, px_seg) for each calendar year (ts must be sorted)."""
+    if len(ts) == 0:
+        return
+    years = ts.astype("datetime64[ms]").astype("datetime64[Y]").astype(np.int64) + 1970
+    cuts = np.nonzero(np.diff(years))[0] + 1
+    bounds = np.concatenate([[0], cuts, [len(ts)]])
+    for a, b in zip(bounds[:-1], bounds[1:]):
+        yield int(years[a]), ts[a:b], px[a:b]
 
 
 def convert_csvs_to_bin(raw_dir, symbol, bin_dir, sides=SIDES, log=print):
     """Merge every '<symbol>_ticks_*_<side>.csv' in raw_dir into per-year .npz.
 
     Safe to re-run: existing years are overwritten with the merged result.
+    Each side is merged in memory, so very long histories may be converted
+    in several runs with different raw directories per period.
     """
     os.makedirs(bin_dir, exist_ok=True)
     for side in sides:
@@ -161,20 +192,23 @@ def convert_csvs_to_bin(raw_dir, symbol, bin_dir, sides=SIDES, log=print):
 # coverage audit
 # ---------------------------------------------------------------------------
 def audit_coverage(bin_dir, sides=SIDES, log=print):
-    """Print per-year coverage: first/last tick, count, weekdays without ticks."""
+    """Print per-year coverage: first/last tick, count, and the weekdays
+    between the first and last tick that have no ticks at all (holidays such
+    as Dec 25 / Jan 1 are expected to show up here)."""
     for side in sides:
         side = side.upper()
         log(f"\n===== {side} =====")
         for path in npz_files(bin_dir, side):
             year = int(os.path.basename(path)[len(side) + 1:-4])
-            z = np.load(path)
-            ts = z["ts"]
+            with np.load(path) as z:
+                ts = z["ts"]
             if len(ts) == 0:
                 log(f"{year}: EMPTY")
                 continue
             d = pd.to_datetime(ts, unit="ms", utc=True)
             days = pd.Series(d.date).value_counts()
-            idx = pd.date_range(f"{year}-01-01", f"{year}-12-31", freq="B")
+            # only weekdays inside the covered span (partial years are normal)
+            idx = pd.date_range(d[0].date(), d[-1].date(), freq="B")
             missing = [x.date() for x in idx if x.date() not in days.index]
             monthly = d.strftime("%Y-%m").value_counts().sort_index()
             monthly_str = " ".join(f"{m[5:]}:{v / 1000:.0f}k" for m, v in monthly.items())
@@ -214,10 +248,7 @@ def _cli():
     if args.cmd == "csv2bin":
         convert_csvs_to_bin(args.raw_dir, args.symbol, args.bin_dir)
     elif args.cmd == "bars":
-        mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}
-        num = "".join(ch for ch in args.tf if ch.isdigit())
-        unit = "".join(ch for ch in args.tf if ch.isalpha()) or "m"
-        bar_ms = int(num or 1) * mult[unit[0]] * 1000
+        bar_ms = timeframe_ms(args.tf)
         ts, px = load_ticks(args.bin_dir, args.side, args.years)
         bars = build_bars(ts, px, bar_ms)
         np.savez_compressed(args.out, **bars)

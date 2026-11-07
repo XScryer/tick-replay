@@ -1,7 +1,9 @@
 """Worked example: EURUSD M15 wick-fade strategy on real cTrader ticks.
 
-This is a complete, runnable strategy — not a toy. It ports a real
-research-grade setup:
+A complete, runnable reference strategy showing how to drive the engine
+from bar-based signals. It is an example of the workflow, NOT a
+recommendation: the parameters below are the author's own settings and no
+out-of-sample evidence is included in this repository.
 
   - CyclicRSI (cRSI) on bar closes, two speeds (fast + 4x slow for HTF filter)
   - Entry: rejection-wick fade — long lower wick / short upper wick
@@ -9,34 +11,35 @@ research-grade setup:
   - Optional regime gate: skip fades while the market is in a confirmed leg
     (tickreplay.regime.regime_opinion)
   - Exits on ticks: SL / TP / break-even trigger, real spread filter,
-    measured commission and swap
+    commission and swap (set yours with --commission / --swap-buy / --swap-sell)
   - Position sizing: fixed lot or the compound "ladder" (volume grows with
     equity — implemented through the engine's callable `vol`)
 
-Requires EURUSD tick data in .npz format (see README quickstart):
+Requires EURUSD tick data in .npz format (see the README quickstart):
 
-    py -m tickreplay.ctrader --symbol EURUSD --from 2019-01-01 --to 2026-12-31 --out data/EURUSD/raw
-    py -m tickreplay.data csv2bin --raw-dir data/EURUSD/raw --symbol EURUSD --bin-dir data/EURUSD/bin
-    py examples/eurusd_wick_fade.py --bin-dir data/EURUSD/bin --from 2020-01-01 --to 2024-12-31
+    python -m tickreplay.ctrader --symbol EURUSD --from 2024-01-01 --to 2024-12-31 --out data/EURUSD/raw
+    python -m tickreplay.data csv2bin --raw-dir data/EURUSD/raw --symbol EURUSD --bin-dir data/EURUSD/bin
+    python examples/eurusd_wick_fade.py --bin-dir data/EURUSD/bin --from 2024-02-01 --to 2024-12-31
 """
 
 import argparse
 import datetime as dt
-import os
 
 import numpy as np
 import pandas as pd
 
-from tickreplay.data import build_bars, load_ticks
+from tickreplay.data import build_bars, load_ticks, timeframe_ms
 from tickreplay.regime import regime_opinion
-from tickreplay.replay import (CostModel, ExitRules, ReplayEngine)
+from tickreplay.replay import CostModel, ExitRules, ReplayEngine
 
 PIP = 0.0001
-BAR_15M_MS = 900_000
+DAY_MS = 86_400_000
+WARMUP_DAYS = 30        # bar history before --from for indicator warm-up
+TAIL_DAYS = 30          # tick history after --to so open trades can close
 
 
 # ---------------------------------------------------------------------------
-# CyclicRSI — port of the cRSI engine used by the strategy
+# CyclicRSI (cRSI, after Lars von Thienen) — smoothed, phase-shifted RSI
 # ---------------------------------------------------------------------------
 class CyclicRSI:
     def __init__(self, dom_cycle):
@@ -78,12 +81,12 @@ class CyclicRSI:
 
 
 # ---------------------------------------------------------------------------
-# configuration — presets measured on EURUSD M15 real ticks
+# configuration presets (EURUSD M15)
 # ---------------------------------------------------------------------------
 PRESETS = {
-    # validated configuration (regime gate K=12, net=10p, ER>=0.45,
-    # consensus 6 bars) — see repo docs for the research behind it
-    "quilate_regK": dict(
+    # with the regime gate (K=12 bars, net move >= 10 pips, efficiency >= 0.45,
+    # 6-bar backward consensus) and the Thursday-after-16:00 rule
+    "wick_fade_regime": dict(
         stop_pips=10.0, be_trigger_pips=12.0, take_pips=32.0,
         be_offset_pips=0.0, exit_mode=0, partial_size=0.01,
         max_spread_pips=1.5, cycle=24, oversold=22.5, overbought=80.0,
@@ -93,8 +96,8 @@ PRESETS = {
         regime_gate=True, regime_K=12, regime_net=10.0,
         regime_er_hi=0.45, regime_er_lo=0.25, regime_rng=25.0,
         regime_pers=6),
-    # same setup without the regime gate
-    "campeao": dict(
+    # same setup without the regime gate and without the Thursday rule
+    "wick_fade": dict(
         stop_pips=10.0, be_trigger_pips=12.0, take_pips=32.0,
         be_offset_pips=0.0, exit_mode=0, partial_size=0.01,
         max_spread_pips=1.5, cycle=24, oversold=22.5, overbought=80.0,
@@ -103,13 +106,6 @@ PRESETS = {
         lot_step=0.01, max_lot=0.20, fixed_lot=0.01,
         regime_gate=False),
 }
-
-
-def _tf_to_ms(tf):
-    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}
-    num = "".join(c for c in tf if c.isdigit())
-    unit = "".join(c for c in tf if c.isalpha()) or "m"
-    return int(num or 1) * mult[unit[0]] * 1000
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +125,7 @@ def generate_signals(bars, start_ms, end_ms, cfg):
                 pers=cfg.get("regime_pers", 3), pip=PIP)
             if cfg.get("regime_gate") else None)
     days = (t0 // 86_400_000).astype(np.int64)
-    dow = (4 + days) % 7                     # epoch = Thursday (MQL 4)
+    dow = (4 + days) % 7                     # 0=Sunday (1970-01-01 = Thursday = 4)
     hour = ((t0 // 3_600_000) % 24).astype(np.int64)
 
     signals = []
@@ -228,6 +224,7 @@ def export_csv(trades, path):
         "ext_t": pd.Timestamp(t.exit_ts, unit="ms", tz="UTC").strftime("%Y.%m.%d %H:%M:%S"),
         "entry": f"{t.entry:.5f}", "vol": t.volume, "usd": f"{t.pnl_usd:.2f}",
         "pips": f"{t.pnl_pips:.1f}", "reason": t.reason, "nights": t.nights,
+        "swap_days": t.swap_days,
     } for t in trades])
     df.to_csv(path, sep=";", index=False)
     print(f"  trades -> {path}")
@@ -241,15 +238,16 @@ def main():
                     help="test start YYYY-MM-DD (UTC)")
     ap.add_argument("--to", dest="date_to", required=True,
                     help="test end YYYY-MM-DD (UTC)")
-    ap.add_argument("--preset", default="quilate_regK", choices=list(PRESETS))
+    ap.add_argument("--preset", default="wick_fade_regime", choices=list(PRESETS))
     ap.add_argument("--deposit", type=float, default=150.0)
     ap.add_argument("--tf", default="15m", help="bar size built from ticks")
     ap.add_argument("--commission", type=float, default=3.67,
-                    help="round-trip commission USD per 1.0 lot")
+                    help="round-trip commission USD per 1.0 lot (default: one "
+                         "broker's raw-spread account; use yours)")
     ap.add_argument("--swap-buy", type=float, default=-7.08,
-                    help="swap USD per 1.0 lot per night, BUY")
+                    help="swap USD per 1.0 lot per swap day, BUY")
     ap.add_argument("--swap-sell", type=float, default=1.10,
-                    help="swap USD per 1.0 lot per night, SELL")
+                    help="swap USD per 1.0 lot per swap day, SELL")
     ap.add_argument("--out", default=None, help="trades CSV path")
     args = ap.parse_args()
 
@@ -261,17 +259,18 @@ def main():
                   + dt.timedelta(days=1))
                  .replace(tzinfo=dt.timezone.utc).timestamp() * 1000)
 
-    bar_ms = _tf_to_ms(args.tf)
-    bar_y0 = pd.Timestamp(start_ms, unit="ms", tz="UTC").year - 1
-    bar_y1 = pd.Timestamp(end_ms, unit="ms", tz="UTC").year
-    bar_years = list(range(bar_y0, bar_y1 + 1))
-    tick_years = list(range(bar_y0 - 1, bar_y1 + 2))
-    print(f"bars {args.tf}: years {bar_years} | ticks: years {tick_years}")
+    bar_ms = timeframe_ms(args.tf)
+    # load only the window needed (plus warm-up / tail), not whole years
+    bars_from = start_ms - WARMUP_DAYS * DAY_MS
+    ticks_to = end_ms + TAIL_DAYS * DAY_MS
 
-    # bars from BID ticks (broker convention: bars print on bid)
-    ts_b, px_b = load_ticks(args.bin_dir, "BID", bar_years)
+    # bars from BID ticks (same convention as MT4/MT5 charts)
+    ts_b, px_b = load_ticks(args.bin_dir, "BID", start_ms=bars_from, end_ms=end_ms)
     bars = build_bars(ts_b, px_b, bar_ms)
-    print(f"bars: {len(bars['t0'])}")
+    del ts_b, px_b
+    print(f"bars {args.tf}: {len(bars['t0'])}")
+    if len(bars["t0"]) == 0:
+        raise SystemExit(f"no BID ticks in {args.bin_dir} for {args.date_from}..{args.date_to}")
 
     print("generating signals...", flush=True)
     signals = generate_signals(bars, start_ms, end_ms, cfg)
@@ -280,11 +279,9 @@ def main():
     print("loading ticks...", flush=True)
     data = {}
     for side in ("BID", "ASK"):
-        ts, px = load_ticks(args.bin_dir, side, tick_years)
-        lo = start_ms - 2 * 86_400_000
-        keep = ts >= lo
-        data[side] = (ts[keep], px[keep])
-        print(f"  {side}: {len(ts[keep]) / 1e6:.1f}M ticks")
+        data[side] = load_ticks(args.bin_dir, side, start_ms=start_ms - DAY_MS,
+                                end_ms=ticks_to)
+        print(f"  {side}: {len(data[side][0]) / 1e6:.1f}M ticks")
 
     costs = CostModel(
         pip_size=PIP,

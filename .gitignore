@@ -25,3 +25,7 @@ trades_*.csv
 *.egg-info/
 dist/
 build/
+
+# tooling caches
+.pytest_cache/
+.ruff_cache/
