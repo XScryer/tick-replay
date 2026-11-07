@@ -1,0 +1,27 @@
+# secrets — never commit
+.env
+*.env
+!.env.example
+
+# downloaded market data (regenerable, large)
+data/
+*.npz
+!examples/**/*.npz
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS / editor
+Thumbs.db
+.DS_Store
+*.log
+trades_*.csv
+
+# packaging
+*.egg-info/
+dist/
+build/

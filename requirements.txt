@@ -1,0 +1,4 @@
+numpy>=1.26
+pandas>=2.0
+ctrader-open-api>=0.9
+twisted>=22.0
