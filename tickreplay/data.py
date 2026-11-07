@@ -75,10 +75,10 @@ def build_bars(ts, px, bar_ms):
     if n == 0:
         return empty
     bar_id = ts // bar_ms
-    muda = np.empty(n, dtype=bool)
-    muda[0] = True
-    muda[1:] = bar_id[1:] != bar_id[:-1]
-    starts = np.nonzero(muda)[0]
+    changed = np.empty(n, dtype=bool)
+    changed[0] = True
+    changed[1:] = bar_id[1:] != bar_id[:-1]
+    starts = np.nonzero(changed)[0]
     ends = np.append(starts[1:], n)
     t0 = (bar_id[starts] * bar_ms).astype(np.float64)
     return {

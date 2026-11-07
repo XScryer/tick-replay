@@ -60,7 +60,7 @@ cp .env.example .env   # fill in your cTrader Open API app credentials
 
    ```bash
    python examples/eurusd_wick_fade.py \
-       --bin-dir data/EURUSD/bin --de 2020-01-01 --ate 2024-12-31
+       --bin-dir data/EURUSD/bin --from 2020-01-01 --to 2024-12-31
    ```
 
 5. **No account yet? Try synthetic data** to smoke-test the engine:
@@ -68,7 +68,7 @@ cp .env.example .env   # fill in your cTrader Open API app credentials
    ```bash
    python examples/synthetic_ticks.py --days 10 --out data/SYNTH/raw
    python -m tickreplay.data csv2bin --raw-dir data/SYNTH/raw --symbol SYNTH --bin-dir data/SYNTH/bin
-   python examples/eurusd_wick_fade.py --bin-dir data/SYNTH/bin --de 2024-01-02 --ate 2024-01-09
+   python examples/eurusd_wick_fade.py --bin-dir data/SYNTH/bin --from 2024-01-02 --to 2024-01-09
    ```
 
 ## Repository layout

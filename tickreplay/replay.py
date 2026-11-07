@@ -91,20 +91,20 @@ def count_rollovers(t_start_ms, t_end_ms, offset_fn):
     t = t_start_ms
     while t < t_end_ms and n < 400:
         off = offset_fn(t)
-        prox_h = (24 - off) % 24
-        cand = (t // 86_400_000) * 86_400_000 + prox_h * 3_600_000
-        if cand <= t:
-            cand += 86_400_000
-        off2 = offset_fn(cand)
-        if off2 != off:
-            prox_h = (24 - off2) % 24
-            cand = (t // 86_400_000) * 86_400_000 + prox_h * 3_600_000
-            if cand <= t:
-                cand += 86_400_000
-        if cand > t_end_ms:
+        utc_hour = (24 - off) % 24
+        candidate = (t // 86_400_000) * 86_400_000 + utc_hour * 3_600_000
+        if candidate <= t:
+            candidate += 86_400_000
+        off_at = offset_fn(candidate)
+        if off_at != off:
+            utc_hour = (24 - off_at) % 24
+            candidate = (t // 86_400_000) * 86_400_000 + utc_hour * 3_600_000
+            if candidate <= t:
+                candidate += 86_400_000
+        if candidate > t_end_ms:
             break
         n += 1
-        t = cand + 1
+        t = candidate + 1
     return n
 
 
@@ -233,14 +233,14 @@ class ReplayEngine:
         """First cross-side tick >= ent_t and the prices at that instant."""
         kb = bisect_left(self.bid_ts, ent_t)
         ka = bisect_left(self.ask_ts, ent_t)
-        cand = []
+        candidate = []
         if kb < len(self.bid_ts):
-            cand.append(int(self.bid_ts[kb]))
+            candidate.append(int(self.bid_ts[kb]))
         if ka < len(self.ask_ts):
-            cand.append(int(self.ask_ts[ka]))
-        if not cand:
+            candidate.append(int(self.ask_ts[ka]))
+        if not candidate:
             return None, None, None
-        t_dec = min(cand)
+        t_dec = min(candidate)
         ib = bisect_left(self.bid_ts, t_dec) - 1
         ia = bisect_left(self.ask_ts, t_dec) - 1
         if ib < 0 or ia < 0:
@@ -261,63 +261,63 @@ class ReplayEngine:
             side_ts, side_px = self.ask_ts, self.ask_px
             be_px = entry - be_off
 
-        k0 = bisect_left(side_ts, t_dec)
+        start_idx = bisect_left(side_ts, t_dec)
         be_done = partial_done = False
-        vol_rest = vol
+        vol_left = vol
         legs = []
-        j = k0
+        j = start_idx
         n = len(side_ts)
         while j < n:
             t = int(side_ts[j])
             px = float(side_px[j])
             if buy:
                 if px <= sl:
-                    legs.append((t, min(sl, px), vol_rest, "sl")); break
+                    legs.append((t, min(sl, px), vol_left, "sl")); break
                 if px >= tp:
-                    legs.append((t, tp, vol_rest, "tp")); break
+                    legs.append((t, tp, vol_left, "tp")); break
                 if not be_done and trig_d > 0 and px >= entry + trig_d:
                     be_done = True
                     sl = be_px
                     if exits.partial_lots > 0 and not partial_done and \
-                       vol_rest > exits.partial_lots + exits.min_lot - 1e-9:
-                        fecha = min(exits.partial_lots, vol_rest - exits.min_lot)
-                        if fecha > 0:
-                            legs.append((t, px, fecha, "partial"))
-                            vol_rest -= fecha
+                       vol_left > exits.partial_lots + exits.min_lot - 1e-9:
+                        qty = min(exits.partial_lots, vol_left - exits.min_lot)
+                        if qty > 0:
+                            legs.append((t, px, qty, "partial"))
+                            vol_left -= qty
                             partial_done = True
             else:
                 if px >= sl:
-                    legs.append((t, max(sl, px), vol_rest, "sl")); break
+                    legs.append((t, max(sl, px), vol_left, "sl")); break
                 if px <= tp:
-                    legs.append((t, tp, vol_rest, "tp")); break
+                    legs.append((t, tp, vol_left, "tp")); break
                 if not be_done and trig_d > 0 and px <= entry - trig_d:
                     be_done = True
                     sl = be_px
                     if exits.partial_lots > 0 and not partial_done and \
-                       vol_rest > exits.partial_lots + exits.min_lot - 1e-9:
-                        fecha = min(exits.partial_lots, vol_rest - exits.min_lot)
-                        if fecha > 0:
-                            legs.append((t, px, fecha, "partial"))
-                            vol_rest -= fecha
+                       vol_left > exits.partial_lots + exits.min_lot - 1e-9:
+                        qty = min(exits.partial_lots, vol_left - exits.min_lot)
+                        if qty > 0:
+                            legs.append((t, px, qty, "partial"))
+                            vol_left -= qty
                             partial_done = True
             j += 1
 
         if not legs:
-            if j > k0:
+            if j > start_idx:
                 legs.append((int(side_ts[j - 1]), float(side_px[j - 1]),
-                             vol_rest, "eod"))
+                             vol_left, "eod"))
             else:
                 return None
 
         exit_ts = legs[-1][0]
         usd = 0.0
-        for (_te, pxe, ve, _mot) in legs:
-            pips = (pxe - entry) / pip if buy else (entry - pxe) / pip
-            usd += pips * c.pip_value_usd_per_lot * ve
+        for (_texit, pxexit, qexit, _reason) in legs:
+            pips = (pxexit - entry) / pip if buy else (entry - pxexit) / pip
+            usd += pips * c.pip_value_usd_per_lot * qexit
         usd -= c.commission_per_lot_rt * vol
-        noches = count_rollovers(t_dec, exit_ts, c.rollover_offset)
+        rollovers = count_rollovers(t_dec, exit_ts, c.rollover_offset)
         usd += (c.swap_per_lot_night_buy if buy else c.swap_per_lot_night_sell) \
-            * vol * noches
+            * vol * rollovers
 
         last_px = legs[-1][1]
         pnl_pips = (last_px - entry) / pip if buy else (entry - last_px) / pip
@@ -325,6 +325,6 @@ class ReplayEngine:
             direction="BUY" if buy else "SELL",
             decision_ts=t_dec, entry_ts=t_dec, entry=entry,
             exit_ts=exit_ts, volume=vol, pnl_usd=usd, pnl_pips=pnl_pips,
-            reason=legs[-1][3], nights=noches, exits=legs,
+            reason=legs[-1][3], nights=rollovers, exits=legs,
             meta=dict(s.get("meta") or {}),
         )

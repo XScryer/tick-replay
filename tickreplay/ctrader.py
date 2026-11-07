@@ -116,10 +116,10 @@ def oauth_flow(env):
     srv.shutdown()
     if "code" not in result:
         raise RuntimeError("OAuth timed out after 10 minutes")
-    tok = auth.getToken(result["code"])
-    if "accessToken" not in tok:
-        raise RuntimeError(f"code exchange failed: {tok}")
-    return {"access": tok["accessToken"], "refresh": tok.get("refreshToken", "")}
+    token_resp = auth.getToken(result["code"])
+    if "accessToken" not in token_resp:
+        raise RuntimeError(f"code exchange failed: {token_resp}")
+    return {"access": token_resp["accessToken"], "refresh": token_resp.get("refreshToken", "")}
 
 
 def _ts_ms(d):
@@ -143,9 +143,9 @@ def download_ticks(symbol, date_from, date_to, out_dir,
 
     tokens = {k: env[k] for k in TOKEN_KEYS if env.get(k)}
     if not tokens.get("CTRADER_ACCESS_TOKEN"):
-        tok = oauth_flow(env)
-        tokens.update({"CTRADER_ACCESS_TOKEN": tok["access"],
-                       "CTRADER_REFRESH_TOKEN": tok["refresh"]})
+        token_resp = oauth_flow(env)
+        tokens.update({"CTRADER_ACCESS_TOKEN": token_resp["access"],
+                       "CTRADER_REFRESH_TOKEN": token_resp["refresh"]})
         save_env_tokens(tokens, env_path)
     access = tokens["CTRADER_ACCESS_TOKEN"]
 
@@ -155,20 +155,20 @@ def download_ticks(symbol, date_from, date_to, out_dir,
     from ctrader_open_api.messages import OpenApiCommonMessages_pb2 as OAC
     from twisted.internet import reactor
 
-    ini = dt.datetime.strptime(date_from, "%Y-%m-%d")
-    fim_d = dt.datetime.strptime(date_to, "%Y-%m-%d") + dt.timedelta(days=1)
+    d_start = dt.datetime.strptime(date_from, "%Y-%m-%d")
+    end_dt = dt.datetime.strptime(date_to, "%Y-%m-%d") + dt.timedelta(days=1)
 
     ctx = {
-        "accountId": "", "symbolId": None, "digits": 5,
-        "erro": None, "fim": False, "chamadas": 0,
-        "fila": [], "atual": None, "buf": {},
+        "account_id": "", "symbolId": None, "digits": 5,
+        "error": None, "done": False, "requests": 0,
+        "queue": [], "current": None, "buffer": {},
     }
 
     client = Client(EndPoints.PROTOBUF_LIVE_HOST, EndPoints.PROTOBUF_PORT,
                     TcpProtocol)
 
     def heartbeat():
-        if not ctx.get("fim"):
+        if not ctx.get("done"):
             try:
                 client.send(OAC.ProtoHeartbeatEvent(),
                             responseTimeoutInSeconds=60).addErrback(lambda f: None)
@@ -176,61 +176,61 @@ def download_ticks(symbol, date_from, date_to, out_dir,
                 pass
             reactor.callLater(10, heartbeat)
 
-    def erro(f, fase):
-        print(f"[ERROR {fase}]", repr(f))
-        ctx["erro"] = fase
-        fim()
+    def fail(f, stage):
+        print(f"[ERROR {stage}]", repr(f))
+        ctx["error"] = stage
+        shutdown()
 
-    def on_erro(msg, fase):
-        print(f"[ERROR {fase}]", Protobuf.extract(msg))
-        ctx["erro"] = fase
-        fim()
+    def on_api_error(msg, stage):
+        print(f"[ERROR {stage}]", Protobuf.extract(msg))
+        ctx["error"] = stage
+        shutdown()
 
     # ---- flow: app auth -> account list -> account auth -> symbols -> ticks
-    def passo_app_auth(_):
+    def step_app_auth(_):
         req = OA.ProtoOAGetAccountListByAccessTokenReq()
         req.accessToken = access
         client.send(req, responseTimeoutInSeconds=20).addCallbacks(
-            passo_account_list, lambda f: erro(f, "account_list"))
+            step_account_list, lambda f: fail(f, "account_list"))
 
-    def passo_account_list(msg):
+    def step_account_list(msg):
         if msg.payloadType == OA.ProtoOAErrorRes().payloadType:
-            return on_erro(msg, "account_list")
+            return on_api_error(msg, "account_list")
         res = Protobuf.extract(msg)
-        contas = list(getattr(res, "ctidTraderAccount", []))
-        live = [c for c in contas if getattr(c, "isLive", False)]
-        escolhida = live[0] if live else contas[0]
-        ctx["accountId"] = str(escolhida.ctidTraderAccountId)
-        print(f"account: id={ctx['accountId']}")
+        accounts = list(getattr(res, "ctidTraderAccount", []))
+        live = [c for c in accounts if getattr(c, "isLive", False)]
+        chosen = live[0] if live else accounts[0]
+        ctx["account_id"] = str(chosen.ctidTraderAccountId)
+        print(f"account: id={ctx['account_id']}")
         req = OA.ProtoOAAccountAuthReq()
-        req.ctidTraderAccountId = int(ctx["accountId"])
+        req.ctidTraderAccountId = int(ctx["account_id"])
         req.accessToken = access
         client.send(req, responseTimeoutInSeconds=20).addCallbacks(
-            passo_symbols, lambda f: erro(f, "account_auth"))
+            step_symbols, lambda f: fail(f, "account_auth"))
 
-    def passo_symbols(_):
+    def step_symbols(_):
         req = OA.ProtoOASymbolsListReq()
-        req.ctidTraderAccountId = int(ctx["accountId"])
+        req.ctidTraderAccountId = int(ctx["account_id"])
         req.includeArchivedSymbols = False
         client.send(req, responseTimeoutInSeconds=30).addCallbacks(
-            passo_escolher_symbol, lambda f: erro(f, "symbols"))
+            step_pick_symbol, lambda f: fail(f, "symbols"))
 
-    def passo_escolher_symbol(msg):
+    def step_pick_symbol(msg):
         if msg.payloadType == OA.ProtoOAErrorRes().payloadType:
-            return on_erro(msg, "symbols")
+            return on_api_error(msg, "symbols")
         res = Protobuf.extract(msg)
-        achou = None
+        found = None
         for s in list(getattr(res, "symbol", [])) + \
                  list(getattr(res, "archivedSymbol", [])):
             if getattr(s, "symbolName", "") == symbol:
-                achou = s
+                found = s
                 break
-        if achou is None:
+        if found is None:
             print("Symbol not found:", symbol)
-            fim()
+            shutdown()
             return
-        ctx["symbolId"] = achou.symbolId
-        ctx["digits"] = getattr(achou, "digits", 5)
+        ctx["symbolId"] = found.symbolId
+        ctx["digits"] = getattr(found, "digits", 5)
         print(f"{symbol}: symbolId={ctx['symbolId']} digits={ctx['digits']}")
 
         # Empirical discovery (probe 2025-06-02): chunkSize=10000;
@@ -239,45 +239,45 @@ def download_ticks(symbol, date_from, date_to, out_dir,
         # following ones are price deltas. One EURUSD day ~= 100-250k
         # ticks/side -> queue of 1 item per day per side, flushed on
         # completion (bounded memory).
-        dias = []
-        d = ini
-        while d < fim_d:
+        days = []
+        d = d_start
+        while d < end_dt:
             if d.weekday() != 5:  # Saturday: forex closed, don't waste calls
-                prox = min(d + dt.timedelta(days=1), fim_d)
-                dias.append((_ts_ms(d), _ts_ms(prox) - 1))  # [d, prox)
+                next_d = min(d + dt.timedelta(days=1), end_dt)
+                days.append((_ts_ms(d), _ts_ms(next_d) - 1))  # [d, next_d)
             d += dt.timedelta(days=1)
 
         # resume: _progress.txt lists "YYYY-MM-DD SIDE" already written
         prog_path = os.path.join(out_dir, "_progress.txt")
-        feitos = set()
+        done_set = set()
         if os.path.exists(prog_path):
             with open(prog_path, "r", encoding="utf-8") as f:
                 for ln in f:
                     p = ln.strip().split()
                     if len(p) == 2:
-                        feitos.add((p[0], p[1]))
+                        done_set.add((p[0], p[1]))
         ctx["prog_path"] = prog_path
-        ctx["fila"] = []
-        for a, b in dias:
-            dia_str = dt.datetime.fromtimestamp(a / 1000, dt.timezone.utc).strftime("%Y-%m-%d")
+        ctx["queue"] = []
+        for a, b in days:
+            day_str = dt.datetime.fromtimestamp(a / 1000, dt.timezone.utc).strftime("%Y-%m-%d")
             for t in ("BID", "ASK"):
-                if (dia_str, t) not in feitos:
-                    ctx["fila"].append((a, b, t))
-        ctx["pulados"] = len(dias) * 2 - len(ctx["fila"])
-        print(f"items to download: {len(ctx['fila'])} "
-              f"({ctx['pulados']} already done)")
-        ctx["atual"] = None
-        ctx["buf"] = {}          # ts_ms -> price_int for current item
-        ctx["tipo_item"] = None
-        ctx["arq_bid"] = os.path.join(
+                if (day_str, t) not in done_set:
+                    ctx["queue"].append((a, b, t))
+        ctx["skipped"] = len(days) * 2 - len(ctx["queue"])
+        print(f"items to download: {len(ctx['queue'])} "
+              f"({ctx['skipped']} already done)")
+        ctx["current"] = None
+        ctx["buffer"] = {}          # ts_ms -> price_int for current item
+        ctx["item_side"] = None
+        ctx["file_bid"] = os.path.join(
             out_dir, f"{symbol}_ticks_{date_from}_{date_to}_BID.csv")
-        ctx["arq_ask"] = os.path.join(
+        ctx["file_ask"] = os.path.join(
             out_dir, f"{symbol}_ticks_{date_from}_{date_to}_ASK.csv")
-        ctx["gravados"] = {"BID": 0, "ASK": 0}
+        ctx["written"] = {"BID": 0, "ASK": 0}
         if not probe:
             os.makedirs(out_dir, exist_ok=True)
             for k in ("bid", "ask"):
-                path = ctx[f"arq_{k}"]
+                path = ctx[f"file_{k}"]
                 # APPEND if it exists: opening with "w" truncated everything
                 # on every resume while _progress.txt kept days marked =
                 # SILENT DATA LOSS
@@ -285,7 +285,7 @@ def download_ticks(symbol, date_from, date_to, out_dir,
                     continue
                 with open(path, "w", encoding="utf-8", newline="") as f:
                     f.write("time_ms,time,price\n")
-        proxima_pagina()
+        next_page()
 
     # ---- tick pagination ----
     # Official docs (help.ctrader.com/open-api/messages):
@@ -295,154 +295,154 @@ def download_ticks(symbol, date_from, date_to, out_dir,
     #   hasMore=true -> the response filled chunkSize and older ticks exist:
     #   request again with toTimestamp = oldest_received - 1.
     #   Official rate limit: 5 req/s for historical requests.
-    def proxima_pagina():
-        if ctx.get("fim"):
+    def next_page():
+        if ctx.get("done"):
             return
-        if ctx["chamadas"] >= max_requests:
+        if ctx["requests"] >= max_requests:
             print("request limit reached")
-            gravar_ou_relatar()
+            finish_and_report()
             return
-        if ctx["atual"] is None:
-            if not ctx["fila"]:
-                gravar_ou_relatar()
+        if ctx["current"] is None:
+            if not ctx["queue"]:
+                finish_and_report()
                 return
-            ctx["atual"] = ctx["fila"].pop(0)
-            ctx["tipo_item"] = ctx["atual"][2]
-            ctx["buf"] = {}
-        ini_usar, fim_usar, tipo = ctx["atual"]
-        if ini_usar >= fim_usar:
+            ctx["current"] = ctx["queue"].pop(0)
+            ctx["item_side"] = ctx["current"][2]
+            ctx["buffer"] = {}
+        win_start, win_end, side = ctx["current"]
+        if win_start >= win_end:
             flush_item()
-            ctx["atual"] = None
-            proxima_pagina()
+            ctx["current"] = None
+            next_page()
             return
         req = OA.ProtoOAGetTickDataReq()
-        req.ctidTraderAccountId = int(ctx["accountId"])
+        req.ctidTraderAccountId = int(ctx["account_id"])
         req.symbolId = ctx["symbolId"]
-        req.type = getattr(OAM.ProtoOAQuoteType, tipo)
-        req.fromTimestamp = ini_usar
-        req.toTimestamp = fim_usar
-        ctx["chamadas"] += 1
-        ctx["req_ini"], ctx["req_fim"], ctx["tipo_req"] = ini_usar, fim_usar, tipo
-        if ctx["chamadas"] <= 3:
-            d1 = dt.datetime.fromtimestamp(ini_usar / 1000, dt.timezone.utc)
-            d2 = dt.datetime.fromtimestamp(fim_usar / 1000, dt.timezone.utc)
-            print(f"  req {tipo}: {d1} -> {d2}")
+        req.type = getattr(OAM.ProtoOAQuoteType, side)
+        req.fromTimestamp = win_start
+        req.toTimestamp = win_end
+        ctx["requests"] += 1
+        ctx["req_from_ms"], ctx["req_to_ms"], ctx["req_side"] = win_start, win_end, side
+        if ctx["requests"] <= 3:
+            d1 = dt.datetime.fromtimestamp(win_start / 1000, dt.timezone.utc)
+            d2 = dt.datetime.fromtimestamp(win_end / 1000, dt.timezone.utc)
+            print(f"  req {side}: {d1} -> {d2}")
         client.send(req, responseTimeoutInSeconds=60).addCallbacks(
-            passo_ticks, lambda f: erro(f, "tickdata"))
+            step_ticks, lambda f: fail(f, "tickdata"))
 
-    def passo_ticks(msg):
+    def step_ticks(msg):
         if msg.payloadType == OA.ProtoOAErrorRes().payloadType:
-            ext = Protobuf.extract(msg)
-            d1 = dt.datetime.fromtimestamp(ctx["req_ini"] / 1000, dt.timezone.utc)
-            d2 = dt.datetime.fromtimestamp(ctx["req_fim"] / 1000, dt.timezone.utc)
-            print(f"[ERROR tickdata {ctx.get('tipo_req')} {d1} -> {d2}]", ext)
-            if "LIMIT" in str(ext).upper() or "429" in str(ext):
+            err_info = Protobuf.extract(msg)
+            d1 = dt.datetime.fromtimestamp(ctx["req_from_ms"] / 1000, dt.timezone.utc)
+            d2 = dt.datetime.fromtimestamp(ctx["req_to_ms"] / 1000, dt.timezone.utc)
+            print(f"[ERROR tickdata {ctx.get('req_side')} {d1} -> {d2}]", err_info)
+            if "LIMIT" in str(err_info).upper() or "429" in str(err_info):
                 print("  rate limit: waiting 10s and retrying")
-                reactor.callLater(10, proxima_pagina)
+                reactor.callLater(10, next_page)
                 return
             # other error: retry the SAME request; only give up on the whole
             # day after 5 failures — never write a partial day or mark
             # progress
-            ctx["erros_item"] = ctx.get("erros_item", 0) + 1
-            if ctx["erros_item"] <= 5:
-                print(f"  non-limit error: retry {ctx['erros_item']}/5 in 10s")
-                reactor.callLater(10, proxima_pagina)
+            ctx["item_errors"] = ctx.get("item_errors", 0) + 1
+            if ctx["item_errors"] <= 5:
+                print(f"  non-limit error: retry {ctx['item_errors']}/5 in 10s")
+                reactor.callLater(10, next_page)
                 return
-            ctx.setdefault("buracos", []).append(
-                (ctx["req_ini"], ctx["req_fim"], ctx["tipo_req"]))
+            ctx.setdefault("gaps", []).append(
+                (ctx["req_from_ms"], ctx["req_to_ms"], ctx["req_side"]))
             print(f"  [GAP] day discarded without writing: "
-                  f"{ctx.get('tipo_req')} "
-                  f"{dt.datetime.fromtimestamp(ctx['req_ini'] / 1000, dt.timezone.utc)} -> "
-                  f"{dt.datetime.fromtimestamp(ctx['req_fim'] / 1000, dt.timezone.utc)}")
-            ctx["buf"] = {}
-            ctx["atual"] = None
-            ctx["erros_item"] = 0
-            proxima_pagina()
+                  f"{ctx.get('req_side')} "
+                  f"{dt.datetime.fromtimestamp(ctx['req_from_ms'] / 1000, dt.timezone.utc)} -> "
+                  f"{dt.datetime.fromtimestamp(ctx['req_to_ms'] / 1000, dt.timezone.utc)}")
+            ctx["buffer"] = {}
+            ctx["current"] = None
+            ctx["item_errors"] = 0
+            next_page()
             return
         res = Protobuf.extract(msg)
-        ctx["erros_item"] = 0
-        tks = list(getattr(res, "tickData", []))
-        tipo = ctx["tipo_req"]
+        ctx["item_errors"] = 0
+        tick_list = list(getattr(res, "tickData", []))
+        side = ctx["req_side"]
         hasMore = getattr(res, "hasMore", False)
-        if tks:
+        if tick_list:
             # rebuild absolute times and absolute prices (newest-first)
-            tempos = [tks[0].timestamp]
-            precos = [tks[0].tick]
-            for i in range(1, len(tks)):
-                tempos.append(tempos[-1] + tks[i].timestamp)  # ms delta (<0)
-                precos.append(precos[-1] + tks[i].tick)       # price delta
-            if ctx["chamadas"] <= 3:
-                print(f"    chunk {len(tks)} ticks, "
-                      f"newest={dt.datetime.fromtimestamp(tempos[0] / 1000, dt.timezone.utc)}, "
-                      f"oldest={dt.datetime.fromtimestamp(tempos[-1] / 1000, dt.timezone.utc)}, "
+            times = [tick_list[0].timestamp]
+            prices = [tick_list[0].tick]
+            for i in range(1, len(tick_list)):
+                times.append(times[-1] + tick_list[i].timestamp)  # ms delta (<0)
+                prices.append(prices[-1] + tick_list[i].tick)       # price delta
+            if ctx["requests"] <= 3:
+                print(f"    chunk {len(tick_list)} ticks, "
+                      f"newest={dt.datetime.fromtimestamp(times[0] / 1000, dt.timezone.utc)}, "
+                      f"oldest={dt.datetime.fromtimestamp(times[-1] / 1000, dt.timezone.utc)}, "
                       f"hasMore={hasMore}")
-                for tp, pr in zip(tempos[:3], precos[:3]):
+                for tp, pr in zip(times[:3], prices[:3]):
                     print(f"      ts={tp} price_int={pr} -> "
                           f"{pr / (10 ** ctx['digits']):.{ctx['digits']}f}")
-            for tp_abs, pr in zip(tempos, precos):
-                ctx["buf"][tp_abs] = pr
+            for tp_abs, pr in zip(times, prices):
+                ctx["buffer"][tp_abs] = pr
             if not hasMore:
                 # hasMore=false -> ALL ticks of the interval: item complete
                 flush_item()
-                ctx["atual"] = None
+                ctx["current"] = None
             else:
                 # next page: same from, to = oldest - 1
-                ctx["atual"] = (ctx["atual"][0], tempos[-1] - 1, tipo)
-                if ctx["atual"][0] >= ctx["atual"][1]:
+                ctx["current"] = (ctx["current"][0], times[-1] - 1, side)
+                if ctx["current"][0] >= ctx["current"][1]:
                     flush_item()
-                    ctx["atual"] = None
+                    ctx["current"] = None
         else:
             # empty chunk: step toTimestamp back 1 day to avoid getting stuck
-            ini0 = ctx["atual"][0]
-            novo_to = ctx["atual"][1] - 86400000
-            if novo_to <= ini0:
+            win0 = ctx["current"][0]
+            new_to = ctx["current"][1] - 86400000
+            if new_to <= win0:
                 flush_item()
-                ctx["atual"] = None
+                ctx["current"] = None
             else:
-                ctx["atual"] = (ini0, novo_to, tipo)
-        if ctx["chamadas"] % 20 == 0:
-            print(f"  {ctx['chamadas']} requests, "
-                  f"{sum(ctx['gravados'].values())} ticks written, "
-                  f"side={tipo}, hasMore={hasMore}")
-        proxima_pagina()
+                ctx["current"] = (win0, new_to, side)
+        if ctx["requests"] % 20 == 0:
+            print(f"  {ctx['requests']} requests, "
+                  f"{sum(ctx['written'].values())} ticks written, "
+                  f"side={side}, hasMore={hasMore}")
+        next_page()
 
     def flush_item():
         """Write the current item's buffer (1 day x side) to CSV and clear."""
-        if probe or ctx["atual"] is None:
-            ctx["buf"] = {}
+        if probe or ctx["current"] is None:
+            ctx["buffer"] = {}
             return
-        tipo = ctx["tipo_item"]
-        arq = ctx["arq_bid"] if tipo == "BID" else ctx["arq_ask"]
-        escala = 10 ** ctx["digits"]
-        with open(arq, "a", encoding="utf-8", newline="") as f:
-            for ts_ in sorted(ctx["buf"]):
+        side = ctx["item_side"]
+        csv_path = ctx["file_bid"] if side == "BID" else ctx["file_ask"]
+        scale = 10 ** ctx["digits"]
+        with open(csv_path, "a", encoding="utf-8", newline="") as f:
+            for ts_ in sorted(ctx["buffer"]):
                 d = dt.datetime.fromtimestamp(ts_ / 1000, dt.timezone.utc)
                 f.write(f"{ts_},{d.strftime('%Y.%m.%d %H:%M:%S.%f')[:-3]},"
-                        f"{ctx['buf'][ts_] / escala:.{ctx['digits']}f}\n")
-        ctx["gravados"][tipo] += len(ctx["buf"])
+                        f"{ctx['buffer'][ts_] / scale:.{ctx['digits']}f}\n")
+        ctx["written"][side] += len(ctx["buffer"])
         # checkpoint: mark the item as done for resume
-        dia_str = dt.datetime.fromtimestamp(
-            ctx["atual"][0] / 1000, dt.timezone.utc).strftime("%Y-%m-%d")
+        day_str = dt.datetime.fromtimestamp(
+            ctx["current"][0] / 1000, dt.timezone.utc).strftime("%Y-%m-%d")
         with open(ctx["prog_path"], "a", encoding="utf-8") as f:
-            f.write(f"{dia_str} {tipo}\n")
-        ctx["buf"] = {}
+            f.write(f"{day_str} {side}\n")
+        ctx["buffer"] = {}
 
-    def gravar_ou_relatar():
-        n = sum(ctx["gravados"].values())
-        print(f"DONE: {ctx['chamadas']} requests, {n} ticks "
-              f"(BID={ctx['gravados']['BID']}, ASK={ctx['gravados']['ASK']}), "
-              f"queue left={len(ctx['fila'])}, gaps={len(ctx.get('buracos', []))}")
+    def finish_and_report():
+        n = sum(ctx["written"].values())
+        print(f"DONE: {ctx['requests']} requests, {n} ticks "
+              f"(BID={ctx['written']['BID']}, ASK={ctx['written']['ASK']}), "
+              f"queue left={len(ctx['queue'])}, gaps={len(ctx.get('gaps', []))}")
         if n == 0:
             print("RESULT: no ticks returned by the API for this period.")
         else:
-            if ctx.get("buracos"):
-                print(f"  gaps ({len(ctx['buracos'])}): {ctx['buracos'][:5]}")
-            print(f"  BID -> {ctx['arq_bid']}")
-            print(f"  ASK -> {ctx['arq_ask']}")
-        fim()
+            if ctx.get("gaps"):
+                print(f"  gaps ({len(ctx['gaps'])}): {ctx['gaps'][:5]}")
+            print(f"  BID -> {ctx['file_bid']}")
+            print(f"  ASK -> {ctx['file_ask']}")
+        shutdown()
 
-    def fim():
-        ctx["fim"] = True
+    def shutdown():
+        ctx["done"] = True
         try:
             reactor.stop()
         except Exception:
@@ -452,17 +452,17 @@ def download_ticks(symbol, date_from, date_to, out_dir,
     req.clientId = env["OPEN_API_CLIENT_ID"]
     req.clientSecret = env["OPEN_API_SECRET"]
     client.send(req, responseTimeoutInSeconds=30).addCallbacks(
-        lambda m: (on_erro(m, "app_auth")
+        lambda m: (on_api_error(m, "app_auth")
                    if m.payloadType == OA.ProtoOAErrorRes().payloadType
-                   else passo_app_auth(m)),
-        lambda f: erro(f, "app_auth"))
+                   else step_app_auth(m)),
+        lambda f: fail(f, "app_auth"))
     client.startService()
     client.setConnectedCallback(lambda c: print("connected"))
     client.setDisconnectedCallback(lambda c, r: print("disconnected:", r))
     heartbeat()
     reactor.run()
-    if ctx.get("erro"):
-        raise RuntimeError(f"download failed at stage: {ctx['erro']}")
+    if ctx.get("error"):
+        raise RuntimeError(f"download failed at stage: {ctx['error']}")
 
 
 def _cli():

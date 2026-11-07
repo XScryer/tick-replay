@@ -17,8 +17,8 @@ HOW TO USE:
     from tickreplay.regime import regime_opinion
 
     # bars: dict of numpy arrays with "t0" (UTC ms) and "o","h","l","c" (price)
-    opin = regime_opinion(bars)                 # validated defaults
-    # opin is an int8 array of the same length as bars["c"]
+    opinion = regime_opinion(bars)                 # validated defaults
+    # opinion is an int8 array of the same length as bars["c"]
 
 Parameters (all optional; defaults validated on EURUSD M15):
 
@@ -85,13 +85,13 @@ def regime_opinion(b, K=12, net_min=10.0, er_hi=0.45, er_lo=0.25,
     raw[(net <= -net_min) & (er >= er_hi)] = 3
 
     # backward consensus: `pers` consecutive bars with the same label
-    opin = np.full(n, -1, dtype=np.int8)
+    opinion = np.full(n, -1, dtype=np.int8)
     for v in (1, 2, 3):
         m = (raw == v).astype(np.int32)
         cs = np.concatenate([[0], np.cumsum(m)])
         ok = (cs[pers:] - cs[:-pers]) == pers
-        opin[np.where(ok)[0] + pers - 1] = v
-    return opin
+        opinion[np.where(ok)[0] + pers - 1] = v
+    return opinion
 
 
 # human-readable state names

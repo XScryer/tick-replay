@@ -17,7 +17,7 @@ Requires EURUSD tick data in .npz format (see README quickstart):
 
     py -m tickreplay.ctrader --symbol EURUSD --from 2019-01-01 --to 2026-12-31 --out data/EURUSD/raw
     py -m tickreplay.data csv2bin --raw-dir data/EURUSD/raw --symbol EURUSD --bin-dir data/EURUSD/bin
-    py examples/eurusd_wick_fade.py --bin-dir data/EURUSD/bin --de 2020-01-01 --ate 2024-12-31
+    py examples/eurusd_wick_fade.py --bin-dir data/EURUSD/bin --from 2020-01-01 --to 2024-12-31
 """
 
 import argparse
@@ -84,43 +84,43 @@ PRESETS = {
     # validated configuration (regime gate K=12, net=10p, ER>=0.45,
     # consensus 6 bars) — see repo docs for the research behind it
     "quilate_regK": dict(
-        stop_pips=10.0, gatilho_pips=12.0, take_pips=32.0,
-        be_offset_pips=0.0, modo_saida=0, vol_parcial=0.01,
-        max_spread_pips=1.5, ciclo=24, os_thr=22.5, ob_thr=80.0,
-        wick_pct=0.40, htf_on=True, hora_ini=14, hora_fim=18,
-        dias_mask=127, qui_desde=16, composto=True, escada_lucro=False,
-        degrau_saldo=50.0, lote_degrau=0.01, lote_max=0.20, lote_fixo=0.01,
+        stop_pips=10.0, be_trigger_pips=12.0, take_pips=32.0,
+        be_offset_pips=0.0, exit_mode=0, partial_size=0.01,
+        max_spread_pips=1.5, cycle=24, oversold=22.5, overbought=80.0,
+        wick_frac=0.40, htf_filter=True, hour_from=14, hour_to=18,
+        days_mask=127, thu_from=16, compound=True, profit_ladder=False,
+        ladder_step=50.0, lot_step=0.01, max_lot=0.20, fixed_lot=0.01,
         regime_gate=True, regime_K=12, regime_net=10.0,
         regime_er_hi=0.45, regime_er_lo=0.25, regime_rng=25.0,
         regime_pers=6),
     # same setup without the regime gate
     "campeao": dict(
-        stop_pips=10.0, gatilho_pips=12.0, take_pips=32.0,
-        be_offset_pips=0.0, modo_saida=0, vol_parcial=0.01,
-        max_spread_pips=1.5, ciclo=24, os_thr=22.5, ob_thr=80.0,
-        wick_pct=0.40, htf_on=True, hora_ini=14, hora_fim=18,
-        dias_mask=127, qui_desde=-1, composto=True, degrau_saldo=50.0,
-        lote_degrau=0.01, lote_max=0.20, lote_fixo=0.01,
+        stop_pips=10.0, be_trigger_pips=12.0, take_pips=32.0,
+        be_offset_pips=0.0, exit_mode=0, partial_size=0.01,
+        max_spread_pips=1.5, cycle=24, oversold=22.5, overbought=80.0,
+        wick_frac=0.40, htf_filter=True, hour_from=14, hour_to=18,
+        days_mask=127, thu_from=-1, compound=True, ladder_step=50.0,
+        lot_step=0.01, max_lot=0.20, fixed_lot=0.01,
         regime_gate=False),
 }
 
 
 def _tf_to_ms(tf):
     mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}
-    num = "".join(ch for ch in tf if ch.isdigit())
-    unit = "".join(ch for ch in tf if ch.isalpha()) or "m"
+    num = "".join(c for c in tf if c.isdigit())
+    unit = "".join(c for c in tf if c.isalpha()) or "m"
     return int(num or 1) * mult[unit[0]] * 1000
 
 
 # ---------------------------------------------------------------------------
 # signal generation — runs on closed bars, emits decision-time signals
 # ---------------------------------------------------------------------------
-def generate_signals(bars, de_ms, ate_ms, cfg):
+def generate_signals(bars, start_ms, end_ms, cfg):
     t0, o, h, l, c = bars["t0"], bars["o"], bars["h"], bars["l"], bars["c"]
     n = len(t0)
-    crsi_l = CyclicRSI(cfg["ciclo"])
-    crsi_h = CyclicRSI(cfg["ciclo"] * 4)
-    opin = (regime_opinion(
+    crsi_fast = CyclicRSI(cfg["cycle"])
+    crsi_slow = CyclicRSI(cfg["cycle"] * 4)
+    opinion = (regime_opinion(
                 bars, K=cfg.get("regime_K", 20),
                 net_min=cfg.get("regime_net", 15.0),
                 er_hi=cfg.get("regime_er_hi", 0.40),
@@ -129,41 +129,41 @@ def generate_signals(bars, de_ms, ate_ms, cfg):
                 pers=cfg.get("regime_pers", 3), pip=PIP)
             if cfg.get("regime_gate") else None)
     days = (t0 // 86_400_000).astype(np.int64)
-    dow_mql = (4 + days) % 7                     # epoch = Thursday (MQL 4)
-    hora = ((t0 // 3_600_000) % 24).astype(np.int64)
+    dow = (4 + days) % 7                     # epoch = Thursday (MQL 4)
+    hour = ((t0 // 3_600_000) % 24).astype(np.int64)
 
     signals = []
     for i in range(1, n - 1):
-        chg = c[i] - c[i - 1]
-        cl = crsi_l.update(chg)
-        ch = crsi_h.update(chg)
-        if not (de_ms <= t0[i + 1] <= ate_ms):
+        change = c[i] - c[i - 1]
+        crsi_f = crsi_fast.update(change)
+        crsi_s = crsi_slow.update(change)
+        if not (start_ms <= t0[i + 1] <= end_ms):
             continue
-        if (cfg["dias_mask"] & (1 << int(dow_mql[i]))) == 0:
+        if (cfg["days_mask"] & (1 << int(dow[i]))) == 0:
             continue
-        if cfg["qui_desde"] >= 0 and int(dow_mql[i]) == 4 \
-                and int(hora[i]) < cfg["qui_desde"]:
+        if cfg["thu_from"] >= 0 and int(dow[i]) == 4 \
+                and int(hour[i]) < cfg["thu_from"]:
             continue
-        if int(hora[i]) < cfg["hora_ini"] or int(hora[i]) > cfg["hora_fim"]:
+        if int(hour[i]) < cfg["hour_from"] or int(hour[i]) > cfg["hour_to"]:
             continue
-        if opin is not None and opin[i] in (2, 3):
+        if opinion is not None and opinion[i] in (2, 3):
             continue                               # regime gate: no fades in legs
-        rng = h[i] - l[i]
-        if rng < 3.0 * PIP:
+        bar_range = h[i] - l[i]
+        if bar_range < 3.0 * PIP:
             continue
         body_lo = min(o[i], c[i])
         body_hi = max(o[i], c[i])
-        lw = (body_lo - l[i]) / rng
-        uw = (h[i] - body_hi) / rng
-        buy = cl <= (cfg["os_thr"] + 5.0) and lw >= cfg["wick_pct"] \
-            and (not cfg["htf_on"] or ch <= 40.0)
-        sell = (not buy) and cl >= (cfg["ob_thr"] - 5.0) and uw >= cfg["wick_pct"] \
-            and (not cfg["htf_on"] or ch >= 60.0)
+        lower_wick = (body_lo - l[i]) / bar_range
+        upper_wick = (h[i] - body_hi) / bar_range
+        buy = crsi_f <= (cfg["oversold"] + 5.0) and lower_wick >= cfg["wick_frac"] \
+            and (not cfg["htf_filter"] or crsi_s <= 40.0)
+        sell = (not buy) and crsi_f >= (cfg["overbought"] - 5.0) and upper_wick >= cfg["wick_frac"] \
+            and (not cfg["htf_filter"] or crsi_s >= 60.0)
         if buy or sell:
             signals.append({
                 "ts": int(t0[i + 1]),               # next bar open = decision time
                 "dir": "BUY" if buy else "SELL",
-                "meta": {"sig_t": int(t0[i]), "cl": cl, "ch": ch},
+                "meta": {"signal_t": int(t0[i]), "crsi_f": crsi_f, "crsi_s": crsi_s},
             })
     return signals
 
@@ -172,18 +172,18 @@ def generate_signals(bars, de_ms, ate_ms, cfg):
 # sizing — fixed lot or compound ladder via the engine's callable vol
 # ---------------------------------------------------------------------------
 def make_sizer(cfg):
-    if not cfg["composto"]:
-        return cfg["lote_fixo"]
+    if not cfg["compound"]:
+        return cfg["fixed_lot"]
 
     def sizer(ctx):
         equity = ctx["equity"]
-        dep0 = ctx["deposit"]
-        if cfg.get("escada_lucro"):
-            degraus = int(max(0.0, equity - dep0) // cfg["degrau_saldo"])
-            return min(cfg["lote_max"], (degraus + 1) * cfg["lote_degrau"])
-        return max(cfg["lote_degrau"],
-                   min(cfg["lote_max"],
-                       (int(equity // cfg["degrau_saldo"])) * cfg["lote_degrau"]))
+        deposit0 = ctx["deposit"]
+        if cfg.get("profit_ladder"):
+            steps = int(max(0.0, equity - deposit0) // cfg["ladder_step"])
+            return min(cfg["max_lot"], (steps + 1) * cfg["lot_step"])
+        return max(cfg["lot_step"],
+                   min(cfg["max_lot"],
+                       (int(equity // cfg["ladder_step"])) * cfg["lot_step"]))
 
     return sizer
 
@@ -191,9 +191,9 @@ def make_sizer(cfg):
 # ---------------------------------------------------------------------------
 # report
 # ---------------------------------------------------------------------------
-def print_report(trades, label, de, ate, deposit):
+def print_report(trades, label, date_from, date_to, deposit):
     if not trades:
-        print(f"{label} {de}->{ate}: 0 trades")
+        print(f"{label} {date_from}->{date_to}: 0 trades")
         return
     tp = sum(1 for p in trades if p.reason == "tp")
     sl = sum(1 for p in trades if p.reason == "sl")
@@ -201,24 +201,24 @@ def print_report(trades, label, de, ate, deposit):
     gp = sum(p.pnl_usd for p in trades if p.pnl_usd > 0)
     gl = abs(sum(p.pnl_usd for p in trades if p.pnl_usd <= 0))
     nb = sum(1 for p in trades if p.direction == "BUY")
-    lucro = sum(p.pnl_usd for p in trades)
-    saldo_fim = deposit + lucro
-    print(f"\n=== {label} {de}->{ate} ===")
+    pnl_total = sum(p.pnl_usd for p in trades)
+    final_balance = deposit + pnl_total
+    print(f"\n=== {label} {date_from}->{date_to} ===")
     print(f"trades={len(trades)} (BUY {nb} / SELL {len(trades) - nb}) | "
-          f"pnl=${lucro:+.2f} | PF={gp / max(gl, 1e-9):.2f}")
-    print(f"  tp={tp} sl={sl} (sl~BE={be}) | final balance=${saldo_fim:.2f}")
+          f"pnl=${pnl_total:+.2f} | PF={gp / max(gl, 1e-9):.2f}")
+    print(f"  tp={tp} sl={sl} (sl~BE={be}) | final balance=${final_balance:.2f}")
     print(f"  BUY ${sum(p.pnl_usd for p in trades if p.direction == 'BUY'):+.2f} | "
           f"SELL ${sum(p.pnl_usd for p in trades if p.direction == 'SELL'):+.2f}")
-    mensal = {}
+    monthly = {}
     for p in trades:
         ym = pd.Timestamp(p.exit_ts, unit="ms", tz="UTC").strftime("%Y-%m")
-        mensal[ym] = mensal.get(ym, 0.0) + p.pnl_usd
-    nmeses = len(mensal)
-    if nmeses:
-        print(f"  pnl/month=${lucro / nmeses:+.2f} | pnl/year=${lucro / nmeses * 12:+.2f} "
-              f"({(lucro / nmeses * 12 / deposit) * 100:+.1f}%/yr on ${deposit:.0f})")
-        pos = sum(1 for v in mensal.values() if v > 0)
-        print(f"  positive months: {pos}/{nmeses}")
+        monthly[ym] = monthly.get(ym, 0.0) + p.pnl_usd
+    n_months = len(monthly)
+    if n_months:
+        print(f"  pnl/month=${pnl_total / n_months:+.2f} | pnl/year=${pnl_total / n_months * 12:+.2f} "
+              f"({(pnl_total / n_months * 12 / deposit) * 100:+.1f}%/yr on ${deposit:.0f})")
+        pos = sum(1 for v in monthly.values() if v > 0)
+        print(f"  positive months: {pos}/{n_months}")
 
 
 def export_csv(trades, path):
@@ -237,8 +237,10 @@ def export_csv(trades, path):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--bin-dir", required=True, help="folder with <SIDE>_<YEAR>.npz")
-    ap.add_argument("--de", required=True, help="test start YYYY-MM-DD (UTC)")
-    ap.add_argument("--ate", required=True, help="test end YYYY-MM-DD (UTC)")
+    ap.add_argument("--from", dest="date_from", required=True,
+                    help="test start YYYY-MM-DD (UTC)")
+    ap.add_argument("--to", dest="date_to", required=True,
+                    help="test end YYYY-MM-DD (UTC)")
     ap.add_argument("--preset", default="quilate_regK", choices=list(PRESETS))
     ap.add_argument("--deposit", type=float, default=150.0)
     ap.add_argument("--tf", default="15m", help="bar size built from ticks")
@@ -252,34 +254,34 @@ def main():
     args = ap.parse_args()
 
     cfg = dict(PRESETS[args.preset])
-    cfg.setdefault("degrau_saldo", 50.0)
-    de_ms = int(dt.datetime.strptime(args.de, "%Y-%m-%d")
+    cfg.setdefault("ladder_step", 50.0)
+    start_ms = int(dt.datetime.strptime(args.date_from, "%Y-%m-%d")
                 .replace(tzinfo=dt.timezone.utc).timestamp() * 1000)
-    ate_ms = int((dt.datetime.strptime(args.ate, "%Y-%m-%d")
+    end_ms = int((dt.datetime.strptime(args.date_to, "%Y-%m-%d")
                   + dt.timedelta(days=1))
                  .replace(tzinfo=dt.timezone.utc).timestamp() * 1000)
 
     bar_ms = _tf_to_ms(args.tf)
-    a_ini = pd.Timestamp(de_ms, unit="ms", tz="UTC").year - 1
-    a_fim = pd.Timestamp(ate_ms, unit="ms", tz="UTC").year
-    anos_barra = list(range(a_ini, a_fim + 1))
-    anos_tick = list(range(a_ini - 1, a_fim + 2))
-    print(f"bars {args.tf}: years {anos_barra} | ticks: years {anos_tick}")
+    bar_y0 = pd.Timestamp(start_ms, unit="ms", tz="UTC").year - 1
+    bar_y1 = pd.Timestamp(end_ms, unit="ms", tz="UTC").year
+    bar_years = list(range(bar_y0, bar_y1 + 1))
+    tick_years = list(range(bar_y0 - 1, bar_y1 + 2))
+    print(f"bars {args.tf}: years {bar_years} | ticks: years {tick_years}")
 
     # bars from BID ticks (broker convention: bars print on bid)
-    ts_b, px_b = load_ticks(args.bin_dir, "BID", anos_barra)
+    ts_b, px_b = load_ticks(args.bin_dir, "BID", bar_years)
     bars = build_bars(ts_b, px_b, bar_ms)
     print(f"bars: {len(bars['t0'])}")
 
     print("generating signals...", flush=True)
-    signals = generate_signals(bars, de_ms, ate_ms, cfg)
+    signals = generate_signals(bars, start_ms, end_ms, cfg)
     print(f"{len(signals)} candidate signals")
 
     print("loading ticks...", flush=True)
     data = {}
     for side in ("BID", "ASK"):
-        ts, px = load_ticks(args.bin_dir, side, anos_tick)
-        lo = de_ms - 2 * 86_400_000
+        ts, px = load_ticks(args.bin_dir, side, tick_years)
+        lo = start_ms - 2 * 86_400_000
         keep = ts >= lo
         data[side] = (ts[keep], px[keep])
         print(f"  {side}: {len(ts[keep]) / 1e6:.1f}M ticks")
@@ -294,9 +296,9 @@ def main():
     )
     exits = ExitRules(
         stop_pips=cfg["stop_pips"], take_pips=cfg["take_pips"],
-        be_trigger_pips=cfg["gatilho_pips"],
+        be_trigger_pips=cfg["be_trigger_pips"],
         be_offset_pips=cfg["be_offset_pips"],
-        partial_lots=cfg["vol_parcial"] if cfg["modo_saida"] == 1 else 0.0,
+        partial_lots=cfg["partial_size"] if cfg["exit_mode"] == 1 else 0.0,
     )
     sizer = make_sizer(cfg)
     for s in signals:
@@ -306,9 +308,9 @@ def main():
                           data["ASK"][0], data["ASK"][1], costs=costs)
     print("replaying...", flush=True)
     trades = engine.run(signals, exits, deposit=args.deposit)
-    print_report(trades, args.preset, args.de, args.ate, args.deposit)
+    print_report(trades, args.preset, args.date_from, args.date_to, args.deposit)
 
-    out = args.out or f"trades_{args.preset}_{args.de}_{args.ate}.csv"
+    out = args.out or f"trades_{args.preset}_{args.date_from}_{args.date_to}.csv"
     export_csv(trades, out)
 
 
