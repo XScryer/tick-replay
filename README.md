@@ -1,4 +1,4 @@
-# tick-replay
+# Tick Replay
 
 [![CI](https://github.com/XScryer/tick-replay/actions/workflows/ci.yml/badge.svg)](https://github.com/XScryer/tick-replay/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
